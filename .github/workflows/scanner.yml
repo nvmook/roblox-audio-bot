@@ -1,0 +1,79 @@
+name: Roblox Audio ID Scanner
+
+on:
+  schedule:
+    # Запускается каждые 6 часов автоматически
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target_ids:
+        description: "Сколько ID проверить за один ран"
+        required: false
+        default: "150000"
+      scan_mode:
+        description: "Режим (hybrid / id_range / catalog)"
+        required: false
+        default: "hybrid"
+      max_run_minutes:
+        description: "Лимит времени работы в минутах (345 для облака GitHub, до 590 для self-hosted)"
+        required: false
+        default: "345"
+
+concurrency:
+  group: roblox-audio-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # 600 минут = 10 часов (на бесплатных GitHub-раннерах платформа ограничивает потолок 360 мин,
+    # поэтому MAX_RUN_MINUTES=345 сохраняет прогресс заранее без потери данных)
+    timeout-minutes: 600
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check required Turso secrets
+        id: check_secrets
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+        run: |
+          if [ -z "$TURSO_DATABASE_URL" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Секрет TURSO_DATABASE_URL ещё не добавлен в Settings -> Secrets -> Actions. Пропускаем запуск."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python 3.12
+        if: steps.check_secrets.outputs.configured == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install FFmpeg (for Shazam audio recognition)
+        if: steps.check_secrets.outputs.configured == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Python dependencies
+        if: steps.check_secrets.outputs.configured == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-scanner.txt
+
+      - name: Run Roblox Audio Scanner
+        if: steps.check_secrets.outputs.configured == 'true'
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          START_ASSET_ID: ${{ vars.START_ASSET_ID || '17500000000' }}
+          TARGET_IDS_PER_RUN: ${{ inputs.target_ids || '150000' }}
+          SCAN_MODE: ${{ inputs.scan_mode || 'hybrid' }}
+          MAX_RUN_MINUTES: ${{ inputs.max_run_minutes || '345' }}
+          SCANNER_CONCURRENCY: "25"
+        run: python -m scanner.roblox_scanner
