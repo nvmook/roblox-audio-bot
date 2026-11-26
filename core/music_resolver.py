@@ -23,12 +23,11 @@ _SLOWED_RE = re.compile(
     r"\b(slowed|reverb|замедлен\w*|словед)\b",
     re.IGNORECASE,
 )
-# Matches upload part markers like "cupsize 1", "cupsize #2", "shadowraze pt 1", "трек ч.2"
 _PART_SUFFIX_RE = re.compile(
     r"(?:\s+[-–—|]?\s*|\s+)(?:#\s*\d{1,2}|(?:pt|part|ч|часть|ver|v)\.?\s*\d{1,2}|\(\d{1,2}\))$",
     re.IGNORECASE,
 )
-_BARE_TRAILING_INDEX_RE = re.compile(r"^([a-zа-яё0-9_]{2,20})\s+([1-9])$", re.IGNORECASE)
+_BARE_TRAILING_INDEX_RE = re.compile(r"^([a-zа-яё0-9_]{2,25})\s+([1-9])$", re.IGNORECASE)
 
 
 def detect_version_tag(raw_name: str) -> str:
@@ -62,7 +61,6 @@ def _strip_version_and_part_markers(text: str) -> tuple[str, str]:
         part_label = m_part.group(0).strip(" -–—|")
         s = s[: m_part.start()].strip(" -–—|")
     else:
-        # Handle "cupsize 1", "кишлак 2" -> single artist word + 1..9 upload index
         m_bare = _BARE_TRAILING_INDEX_RE.match(s)
         if m_bare:
             s = m_bare.group(1)
@@ -78,27 +76,30 @@ def _compute_title_match_score(
 ) -> tuple[float, float]:
     """Separately scores Artist similarity and Title-only similarity.
 
-    Prevents 'cupsize 1' or 'CUPSIZE' from matching 'madk1d, CUPSIZE - 1 мая'
-    just because 'cupsize' matched the artist and '1' matched '1 мая'.
+    Prevents 'cupsize 1', 'три дня дождя 1', or 'CUPSIZE' from matching 'madk1d, CUPSIZE - 1 мая'
+    just because the artist matched and a bare part index '1' matched '1 мая'.
     """
     q_norm = normalize_basic(core_query)
-    q_tokens = expand_number_tokens(q_norm.split())
-    if not q_tokens:
+    raw_q_tokens = q_norm.split()
+    if not raw_q_tokens:
         return 0.0, 0.0
 
     artist_variants = translit_variants(cand_artist).split()
-    # Strip any catalog version suffixes like "(feat. ...)" when comparing core title words
     clean_cand_title = re.sub(r"[\(\[].*?[\)\]]", " ", cand_title)
-    title_norm_tokens = expand_number_tokens(normalize_basic(clean_cand_title).split())
+    raw_title_tokens = normalize_basic(clean_cand_title).split()
     title_variants = translit_variants(clean_cand_title).split()
 
-    if not title_variants or not title_norm_tokens:
+    if not title_variants or not raw_title_tokens:
         return 0.0, 0.0
 
-    # Identify which query tokens DO NOT belong to the artist name -> must describe the SONG TITLE!
+    # Separate raw query tokens into artist tokens vs song-title tokens BEFORE number expansion
     non_artist_q_tokens: list[str] = []
     artist_hit = 0.0
-    for qt in q_tokens:
+    for qt in raw_q_tokens:
+        # Don't let single digits like '1' get swallowed by artist names like 'madk1d'
+        if qt.isdigit() and len(qt) == 1:
+            non_artist_q_tokens.append(qt)
+            continue
         qt_vars = translit_variants(qt).split()
         best_art = 0.0
         for qv in qt_vars:
@@ -111,24 +112,23 @@ def _compute_title_match_score(
         else:
             non_artist_q_tokens.append(qt)
 
-    # If ZERO non-artist words exist (e.g. Roblox audio was just named "CUPSIZE" or "cupsize 1"),
-    # text alone CANNOT know which song it is! Return title_score = 0.0.
+    # Zero song-title words -> cannot guess a song title from catalog!
     if not non_artist_q_tokens:
         return artist_hit, 0.0
 
-    # Single 1-digit token alone (e.g. "1") cannot match a multi-word title like "1 мая"
+    # A bare 1-digit index ('1'..'9') alone cannot match a multi-word song title like '1 мая'
     if (
         len(non_artist_q_tokens) == 1
         and non_artist_q_tokens[0].isdigit()
         and len(non_artist_q_tokens[0]) == 1
-        and len(title_norm_tokens) > 1
+        and len(raw_title_tokens) > 1
     ):
         return artist_hit, 0.0
 
-    # Measure forward coverage (query title words -> candidate title)
+    # Forward coverage: each non-artist query word (with number aliases like 17 -> семнадцать) -> candidate title
     fwd_scores: list[float] = []
     for qt in non_artist_q_tokens:
-        qt_vars = translit_variants(qt).split()
+        qt_vars = translit_variants(" ".join(expand_number_tokens([qt]))).split()
         best = 0.0
         for qv in qt_vars:
             for tv in title_variants:
@@ -137,12 +137,11 @@ def _compute_title_match_score(
                     best = sim
         fwd_scores.append(best)
 
-    # Measure reverse coverage (candidate title words -> query title words)
-    # so "1" doesn't claim 100% match on "1 мая" where "мая" is completely absent!
-    non_artist_all_vars = translit_variants(" ".join(non_artist_q_tokens)).split()
+    # Reverse coverage: each candidate title word -> non-artist query words
+    non_artist_all_vars = translit_variants(" ".join(expand_number_tokens(non_artist_q_tokens))).split()
     rev_scores: list[float] = []
-    for ct in title_norm_tokens:
-        ct_vars = translit_variants(ct).split()
+    for ct in raw_title_tokens:
+        ct_vars = translit_variants(" ".join(expand_number_tokens([ct]))).split()
         best = 0.0
         for cv in ct_vars:
             for qv in non_artist_all_vars:
@@ -155,16 +154,15 @@ def _compute_title_match_score(
     rev_avg = sum(rev_scores) / len(rev_scores)
     title_score = (0.65 * fwd_avg) + (0.35 * rev_avg)
 
-    # Small penalty if candidate is a multi-artist collab (e.g. "madk1d, CUPSIZE")
-    # when the query only mentioned one artist
+    # Slight penalty for unmentioned feature/collab artists ("madk1d, CUPSIZE" when only "cupsize" was in query)
     if ("," in cand_artist or "&" in cand_artist) and artist_hit > 0:
         parts = [p.strip() for p in re.split(r"[,&]", cand_artist) if p.strip()]
-        matched_artists = 0
         q_all_vars = translit_variants(q_norm).split()
-        for part in parts:
-            part_vars = translit_variants(part).split()
-            if any(token_similarity(qv, pv) >= 0.82 for qv in q_all_vars for pv in part_vars):
-                matched_artists += 1
+        matched_artists = sum(
+            1
+            for part in parts
+            if any(token_similarity(qv, pv) >= 0.82 for qv in q_all_vars for pv in translit_variants(part).split())
+        )
         if matched_artists < len(parts):
             title_score -= 0.06
 
@@ -235,7 +233,6 @@ async def resolve_canonical_track(
 
     for cand in candidates:
         art_sc, title_sc = _compute_title_match_score(core_query, cand["artist"], cand["title"])
-        # Remember solo canonical artist spelling (e.g. "cupsize" -> "CUPSIZE") even if no song title was given
         if art_sc >= 0.88 and "," not in cand["artist"] and "&" not in cand["artist"] and not canonical_solo_artist:
             canonical_solo_artist = cand["artist"]
 
@@ -255,10 +252,8 @@ async def resolve_canonical_track(
             "confidence": round(best_combined, 3),
         }
 
-    # If the Roblox audio only had an artist name + part index (like "cupsize 1"),
-    # preserve the real artist casing ("CUPSIZE") and honest clip label instead of guessing "1 мая"!
     if canonical_solo_artist and not fallback_artist:
-        honest_title = f"{canonical_solo_artist} {part_label}".strip() if part_label else (cleaned or raw_roblox_name)
+        honest_title = f"трек {part_label}".strip() if part_label else (cleaned or raw_roblox_name)
         return {
             "artist": canonical_solo_artist,
             "title": append_version_tag(honest_title, ver_tag),

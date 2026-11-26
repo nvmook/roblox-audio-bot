@@ -36,7 +36,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("roblox_scanner")
 
-CURRENT_REPAIR_VERSION = "2"
+CURRENT_REPAIR_VERSION = "3"
 
 CATALOG_KEYWORDS: list[str] = [
     "cupsize", "капсайз", "три дня дождя", "кишлак", "shadowraze", "шадоурейз",
