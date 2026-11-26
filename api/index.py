@@ -19,19 +19,32 @@ app = FastAPI(title="Roblox Audio Finder Bot", docs_url=None, redoc_url=None)
 
 
 @app.get("/")
+@app.get("/index")
+@app.get("/api")
+@app.get("/api/index")
+@app.get("/health")
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"ok": True, "service": "roblox-audio-bot"}
 
 
+@app.get("/setup")
 @app.get("/api/setup")
 async def setup_webhook(
     request: Request,
-    secret: str = Query(..., description="Must match WEBHOOK_SECRET env var"),
+    secret: str = Query(default="", description="Must match WEBHOOK_SECRET env var"),
 ) -> dict[str, Any]:
     expected = get_webhook_secret()
-    if not expected or not hmac.compare_digest(secret, expected):
-        raise HTTPException(status_code=403, detail="Invalid setup secret")
+    if not expected:
+        raise HTTPException(
+            status_code=500,
+            detail="WEBHOOK_SECRET не задан в Environment Variables на Vercel.",
+        )
+    if not secret or not hmac.compare_digest(secret, expected):
+        raise HTTPException(
+            status_code=403,
+            detail="Неверный параметр ?secret=... (должен совпадать с WEBHOOK_SECRET на Vercel).",
+        )
 
     db = Database()
     await db.init_schema()
@@ -50,6 +63,10 @@ async def setup_webhook(
     }
 
 
+@app.post("/")
+@app.post("/index")
+@app.post("/api/index")
+@app.post("/webhook")
 @app.post("/api/webhook")
 async def telegram_webhook(
     request: Request,
