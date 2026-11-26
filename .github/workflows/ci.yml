@@ -15,10 +15,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
-      - name: Install dependencies
+      - name: Install bot & scanner dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          pip install -r requirements.txt
+          pip install -r requirements-scanner.txt pytest
       - name: Run unit tests & syntax check
         run: |
           python -m compileall -q api core scanner tests
