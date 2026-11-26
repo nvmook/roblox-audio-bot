@@ -3,6 +3,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -15,13 +16,48 @@ from core.db import Database
 from core.telegram import TelegramClient
 
 logger = logging.getLogger("roblox_audio_bot")
+
+
+class VercelPathRestoreMiddleware:
+    """Restores original request path on Vercel serverless rewrites before FastAPI routing."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            raw_qs = scope.get("query_string", b"").decode("utf-8", errors="ignore")
+            cur_path = scope.get("path", "")
+            method = scope.get("method", "GET").upper()
+
+            if "__path=" in raw_qs:
+                parsed = parse_qs(raw_qs, keep_blank_values=True)
+                path_vals = parsed.pop("__path", None)
+                if path_vals:
+                    restored = "/" + path_vals[0].lstrip("/")
+                    scope = dict(scope)
+                    scope["path"] = restored
+                    scope["raw_path"] = restored.encode("utf-8")
+                    scope["query_string"] = urlencode(parsed, doseq=True).encode("utf-8")
+            elif cur_path in ("/api/index", "/index", "/api/index.py"):
+                scope = dict(scope)
+                if method == "POST":
+                    restored = "/api/webhook"
+                elif "secret=" in raw_qs:
+                    restored = "/api/setup"
+                else:
+                    restored = "/api/health"
+                scope["path"] = restored
+                scope["raw_path"] = restored.encode("utf-8")
+
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="Roblox Audio Finder Bot", docs_url=None, redoc_url=None)
+app.add_middleware(VercelPathRestoreMiddleware)
 
 
 @app.get("/")
-@app.get("/index")
-@app.get("/api")
-@app.get("/api/index")
 @app.get("/health")
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
@@ -63,9 +99,6 @@ async def setup_webhook(
     }
 
 
-@app.post("/")
-@app.post("/index")
-@app.post("/api/index")
 @app.post("/webhook")
 @app.post("/api/webhook")
 async def telegram_webhook(
