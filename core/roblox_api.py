@@ -28,6 +28,7 @@ async def check_roblox_audio_batch(
     asset_ids: list[int],
     client: httpx.AsyncClient | None = None,
     api_key: str | None = None,
+    chunk_delay_sec: float = 0.6,
 ) -> dict[int, dict[str, Any]]:
     """Checks up to 30 asset IDs per request via Creator Store `items/details`.
 
@@ -49,18 +50,20 @@ async def check_roblox_audio_batch(
     try:
         # Process in chunks of 30 IDs per HTTP call
         for start in range(0, len(asset_ids), 30):
+            if start > 0 and chunk_delay_sec > 0:
+                await asyncio.sleep(chunk_delay_sec)
             chunk = asset_ids[start : start + 30]
             ids_param = ",".join(str(int(x)) for x in chunk)
 
-            for attempt in range(3):
+            for attempt in range(4):
                 resp = await http.get(
                     "https://apis.roblox.com/toolbox-service/v1/items/details",
                     params={"assetIds": ids_param},
                     headers=headers,
                 )
                 if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("Retry-After", "2.0"))
-                    await asyncio.sleep(min(12.0, max(1.0, retry_after * (attempt + 1))))
+                    retry_after = float(resp.headers.get("Retry-After", "3.0"))
+                    await asyncio.sleep(min(20.0, max(2.5, retry_after * (attempt + 1))))
                     continue
                 if resp.status_code != 200:
                     break

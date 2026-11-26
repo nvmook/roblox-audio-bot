@@ -3,6 +3,7 @@ WITHOUT overwriting real Roblox audio duration and WITHOUT hallucinating random 
 when the Roblox upload only has an artist + part number (e.g. 'cupsize 1').
 """
 
+import asyncio
 import re
 from typing import Any
 import httpx
@@ -14,6 +15,8 @@ from core.text_utils import (
     split_artist_title,
     translit_variants,
 )
+
+_RESOLVE_CACHE: dict[str, dict[str, Any]] = {}
 
 _SPED_UP_RE = re.compile(
     r"\b(sped\s*up|speed\s*up|nightcore|ускорен\w*|ускор|спидап|1\.[1-6]x)\b",
@@ -190,38 +193,54 @@ async def resolve_canonical_track(
             "confidence": 0.5,
         }
 
+    cache_key = f"{core_query.lower()}|{ver_tag}"
+    if cache_key in _RESOLVE_CACHE:
+        return dict(_RESOLVE_CACHE[cache_key])
+
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=8.0)
     candidates: list[dict[str, str]] = []
 
     try:
-        try:
-            it_resp = await http.get(
-                "https://itunes.apple.com/search",
-                params={"term": core_query[:80], "media": "music", "entity": "song", "country": "RU", "limit": 6},
-            )
-            if it_resp.status_code == 200:
-                for item in it_resp.json().get("results", []):
-                    art = str(item.get("artistName") or "").strip()
-                    trk = str(item.get("trackName") or "").strip()
-                    if art and trk:
-                        candidates.append({"artist": art, "title": trk})
-        except httpx.HTTPError:
-            pass
+        for attempt in range(2):
+            try:
+                it_resp = await http.get(
+                    "https://itunes.apple.com/search",
+                    params={"term": core_query[:80], "media": "music", "entity": "song", "country": "RU", "limit": 6},
+                )
+                if it_resp.status_code == 429:
+                    await asyncio.sleep(3.0 * (attempt + 1))
+                    continue
+                if it_resp.status_code == 200:
+                    for item in it_resp.json().get("results", []):
+                        art = str(item.get("artistName") or "").strip()
+                        trk = str(item.get("trackName") or "").strip()
+                        if art and trk:
+                            candidates.append({"artist": art, "title": trk})
+                break
+            except httpx.HTTPError:
+                break
 
-        try:
-            dz_resp = await http.get(
-                "https://api.deezer.com/search",
-                params={"q": core_query[:80], "limit": 6},
-            )
-            if dz_resp.status_code == 200:
-                for item in dz_resp.json().get("data", []):
-                    art = str((item.get("artist") or {}).get("name") or "").strip()
-                    trk = str(item.get("title") or "").strip()
-                    if art and trk:
-                        candidates.append({"artist": art, "title": trk})
-        except httpx.HTTPError:
-            pass
+        await asyncio.sleep(0.25)
+
+        for attempt in range(2):
+            try:
+                dz_resp = await http.get(
+                    "https://api.deezer.com/search",
+                    params={"q": core_query[:80], "limit": 6},
+                )
+                if dz_resp.status_code == 429:
+                    await asyncio.sleep(3.0 * (attempt + 1))
+                    continue
+                if dz_resp.status_code == 200:
+                    for item in dz_resp.json().get("data", []):
+                        art = str((item.get("artist") or {}).get("name") or "").strip()
+                        trk = str(item.get("title") or "").strip()
+                        if art and trk:
+                            candidates.append({"artist": art, "title": trk})
+                break
+            except httpx.HTTPError:
+                break
     finally:
         if owns_client:
             await http.aclose()
@@ -246,22 +265,28 @@ async def resolve_canonical_track(
             best_cand = cand
 
     if best_cand and best_title_sc >= 0.68:
-        return {
+        res = {
             "artist": best_cand["artist"],
             "title": append_version_tag(best_cand["title"], ver_tag),
             "confidence": round(best_combined, 3),
         }
+        _RESOLVE_CACHE[cache_key] = res
+        return dict(res)
 
     if canonical_solo_artist and not fallback_artist:
         honest_title = f"трек {part_label}".strip() if part_label else (cleaned or raw_roblox_name)
-        return {
+        res = {
             "artist": canonical_solo_artist,
             "title": append_version_tag(honest_title, ver_tag),
             "confidence": 0.6,
         }
+        _RESOLVE_CACHE[cache_key] = res
+        return dict(res)
 
-    return {
+    res = {
         "artist": fallback_artist,
         "title": append_version_tag(fallback_title or cleaned or raw_roblox_name.strip(), ver_tag),
         "confidence": 0.55,
     }
+    _RESOLVE_CACHE[cache_key] = res
+    return dict(res)

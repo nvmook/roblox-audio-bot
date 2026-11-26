@@ -3,9 +3,10 @@
 Features:
 1. Automatic DB self-repair (`REPAIR_VERSION`) that updates already-saved tracks with
    true Roblox playback duration (`asset.duration` / `ffprobe`) and strict song identification.
-2. Batch Creator Store `items/details` queries (30 Asset IDs per HTTP request) — 30x faster
-   and avoids 429 rate-limit walls while scanning up to 150,000 IDs per run.
-3. Multi-speed Shazam (`1.0x`, `0.80x` anti-sped-up, `0.72x` anti-nightcore, `1.22x` anti-slowed)
+2. Polite rate-limiting (`REQUEST_DELAY_SEC`, default 0.8s) + batch Creator Store `items/details`
+   queries (30 Asset IDs per HTTP request) to avoid HTTP 429 Too Many Requests.
+3. Scans 10,000 IDs per run by default (`TARGET_IDS_PER_RUN=10000`).
+4. Multi-speed Shazam (`1.0x`, `0.80x` anti-sped-up, `0.72x` anti-nightcore, `1.22x` anti-slowed)
    + strict music catalog verification (`Deezer` / `iTunes`).
 """
 
@@ -32,7 +33,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-# Silence verbose per-request httpx logs so Actions logs remain clean and readable
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("roblox_scanner")
 
@@ -54,6 +54,7 @@ async def repair_existing_db_songs(
     db: Database,
     http: httpx.AsyncClient,
     api_key: str,
+    delay_sec: float,
 ) -> int:
     """One-time migration pass that fixes Roblox durations & misidentified titles on existing rows."""
     done_ver = await db.get_scanner_value("repair_version", "0")
@@ -71,7 +72,12 @@ async def repair_existing_db_songs(
     all_ids = [int(r["asset_id"]) for r in rows]
     source_by_id = {int(r["asset_id"]): str(r.get("source") or "catalog") for r in rows}
 
-    meta_map = await check_roblox_audio_batch(all_ids, client=http, api_key=api_key)
+    meta_map = await check_roblox_audio_batch(
+        all_ids,
+        client=http,
+        api_key=api_key,
+        chunk_delay_sec=delay_sec,
+    )
     repaired_batch: list[dict[str, Any]] = []
 
     for aid in all_ids:
@@ -92,7 +98,10 @@ async def repair_existing_db_songs(
                 "is_active": True,
             }
         )
-        if len(repaired_batch) >= 50:
+        if delay_sec > 0:
+            await asyncio.sleep(min(0.6, delay_sec))
+
+        if len(repaired_batch) >= 40:
             await db.upsert_songs_batch(repaired_batch)
             repaired_batch.clear()
 
@@ -100,7 +109,11 @@ async def repair_existing_db_songs(
         await db.upsert_songs_batch(repaired_batch)
 
     await db.set_scanner_values({"repair_version": CURRENT_REPAIR_VERSION})
-    logger.info("DB repair v%s completed (%d tracks refreshed with real Roblox durations).", CURRENT_REPAIR_VERSION, len(meta_map))
+    logger.info(
+        "DB repair v%s completed (%d tracks refreshed with real Roblox durations).",
+        CURRENT_REPAIR_VERSION,
+        len(meta_map),
+    )
     return len(meta_map)
 
 
@@ -108,9 +121,10 @@ async def scan_creator_store_keywords(
     db: Database,
     http: httpx.AsyncClient,
     api_key: str,
-    max_keywords: int = 12,
+    delay_sec: float,
+    max_keywords: int = 8,
 ) -> int:
-    """Queries public Roblox Creator Store Audio search for popular artists/genres."""
+    """Queries public Roblox Creator Store Audio search for popular artists/genres with polite delays."""
     cursor_raw = await db.get_scanner_value("keyword_index", "0")
     kw_idx = int(cursor_raw) if cursor_raw.isdigit() else 0
     saved_total = 0
@@ -128,6 +142,9 @@ async def scan_creator_store_keywords(
                 params={"keyword": keyword, "limit": 30, "pageNumber": 0},
                 headers=headers,
             )
+            if resp.status_code == 429:
+                await asyncio.sleep(max(3.0, delay_sec * 4))
+                continue
             if resp.status_code == 200:
                 items = resp.json().get("data") or []
                 for item in items:
@@ -137,10 +154,18 @@ async def scan_creator_store_keywords(
         except httpx.HTTPError as exc:
             logger.warning("Creator Store query failed for '%s': %s", keyword, exc)
 
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
+
         if not found_ids:
             continue
 
-        meta_map = await check_roblox_audio_batch(found_ids[:30], client=http, api_key=api_key)
+        meta_map = await check_roblox_audio_batch(
+            found_ids[:30],
+            client=http,
+            api_key=api_key,
+            chunk_delay_sec=delay_sec,
+        )
         batch_to_save: list[dict[str, Any]] = []
         for aid, meta in meta_map.items():
             ident = await identify_roblox_audio(meta, client=http, api_key=api_key)
@@ -157,7 +182,8 @@ async def scan_creator_store_keywords(
                     "is_active": True,
                 }
             )
-            await asyncio.sleep(0.08)
+            if delay_sec > 0:
+                await asyncio.sleep(delay_sec)
 
         if batch_to_save:
             saved_total += await db.upsert_songs_batch(batch_to_save)
@@ -174,6 +200,7 @@ async def scan_numeric_id_range(
     api_key: str,
     target_ids: int,
     concurrency: int,
+    delay_sec: float,
     deadline_monotonic: float,
 ) -> tuple[int, int]:
     """Generates numeric Asset IDs and verifies existence & Audio type in batches of 30 IDs."""
@@ -184,16 +211,24 @@ async def scan_numeric_id_range(
     total_scanned_raw = await db.get_scanner_value("total_scanned", "0")
     historical_scanned = int(total_scanned_raw) if total_scanned_raw.isdigit() else 0
 
-    sem = asyncio.Semaphore(max(1, min(concurrency, 10)))
+    safe_concurrency = max(1, min(concurrency, 4))
+    sem = asyncio.Semaphore(safe_concurrency)
     scanned_this_run = 0
     saved_this_run = 0
-    # Each HTTP batch inspects 30 IDs; 50 batches = 1,500 IDs per checkpoint cycle
-    ids_per_cycle = 1500
+    # 300 IDs = 10 HTTP batch calls per progress checkpoint
+    ids_per_cycle = 300
 
     async def inspect_batch_of_30(sub_ids: list[int]) -> list[dict[str, Any]]:
         async with sem:
-            meta_map = await check_roblox_audio_batch(sub_ids, client=http, api_key=api_key)
-            await asyncio.sleep(0.15)
+            meta_map = await check_roblox_audio_batch(
+                sub_ids,
+                client=http,
+                api_key=api_key,
+                chunk_delay_sec=delay_sec,
+            )
+            if delay_sec > 0:
+                await asyncio.sleep(delay_sec)
+
         out: list[dict[str, Any]] = []
         for aid, meta in meta_map.items():
             ident = await identify_roblox_audio(meta, client=http, api_key=api_key)
@@ -210,13 +245,16 @@ async def scan_numeric_id_range(
                     "is_active": True,
                 }
             )
+            if delay_sec > 0:
+                await asyncio.sleep(delay_sec)
         return out
 
     logger.info(
-        "Starting batch numeric ID scan from %d (target=%d, batch_concurrency=%d)",
+        "Starting batch numeric ID scan from %d (target=%d, concurrency=%d, delay=%.2fs)",
         current_id,
         target_ids,
-        min(concurrency, 10),
+        safe_concurrency,
+        delay_sec,
     )
 
     while scanned_this_run < target_ids:
@@ -269,6 +307,7 @@ async def revalidate_existing_songs(
     db: Database,
     http: httpx.AsyncClient,
     api_key: str,
+    delay_sec: float,
     sample_size: int = 30,
 ) -> int:
     """Checks older indexed songs and disables any newly moderated [ Content Deleted ] assets."""
@@ -280,7 +319,12 @@ async def revalidate_existing_songs(
         return 0
 
     ids = [int(r["asset_id"]) for r in rows]
-    meta_map = await check_roblox_audio_batch(ids, client=http, api_key=api_key)
+    meta_map = await check_roblox_audio_batch(
+        ids,
+        client=http,
+        api_key=api_key,
+        chunk_delay_sec=delay_sec,
+    )
     deactivated = 0
     now = int(time.time())
 
@@ -301,9 +345,10 @@ async def revalidate_existing_songs(
 
 
 async def main() -> None:
-    target_ids = int(os.getenv("TARGET_IDS_PER_RUN", "150000"))
-    concurrency = int(os.getenv("SCANNER_CONCURRENCY", "8"))
-    max_run_minutes = float(os.getenv("MAX_RUN_MINUTES", "345"))
+    target_ids = int(os.getenv("TARGET_IDS_PER_RUN", "10000"))
+    concurrency = int(os.getenv("SCANNER_CONCURRENCY", "2"))
+    delay_sec = float(os.getenv("REQUEST_DELAY_SEC", "0.8"))
+    max_run_minutes = float(os.getenv("MAX_RUN_MINUTES", "120"))
     scan_mode = os.getenv("SCAN_MODE", "hybrid").strip().lower()
 
     deadline = time.monotonic() + (max_run_minutes * 60.0)
@@ -312,16 +357,22 @@ async def main() -> None:
     db = Database()
     await db.init_schema()
 
-    limits = httpx.Limits(max_connections=30, max_keepalive_connections=15)
-    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, limits=limits) as http:
-        repaired = await repair_existing_db_songs(db, http, api_key)
+    limits = httpx.Limits(max_connections=15, max_keepalive_connections=10)
+    async with httpx.AsyncClient(timeout=14.0, follow_redirects=True, limits=limits) as http:
+        repaired = await repair_existing_db_songs(db, http, api_key, delay_sec=delay_sec)
 
         catalog_saved = 0
         scanned_ids = 0
         range_saved = 0
 
         if scan_mode in ("hybrid", "catalog"):
-            catalog_saved = await scan_creator_store_keywords(db, http, api_key, max_keywords=10)
+            catalog_saved = await scan_creator_store_keywords(
+                db,
+                http,
+                api_key,
+                delay_sec=delay_sec,
+                max_keywords=8,
+            )
 
         if scan_mode in ("hybrid", "id_range") and time.monotonic() < deadline:
             scanned_ids, range_saved = await scan_numeric_id_range(
@@ -330,12 +381,19 @@ async def main() -> None:
                 api_key=api_key,
                 target_ids=target_ids,
                 concurrency=concurrency,
+                delay_sec=delay_sec,
                 deadline_monotonic=deadline,
             )
 
         deactivated = 0
         if time.monotonic() + 30 < deadline:
-            deactivated = await revalidate_existing_songs(db, http, api_key, sample_size=30)
+            deactivated = await revalidate_existing_songs(
+                db,
+                http,
+                api_key,
+                delay_sec=delay_sec,
+                sample_size=30,
+            )
 
     logger.info(
         "Run finished! Repaired=%d | Catalog saved=%d | Numeric scanned=%d | Numeric saved=%d | Deactivated=%d",

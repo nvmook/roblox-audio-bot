@@ -9,15 +9,19 @@ on:
       target_ids:
         description: "Сколько ID проверить за один ран"
         required: false
-        default: "150000"
+        default: "10000"
+      request_delay:
+        description: "Задержка между запросами в секундах (защита от Too Many Requests)"
+        required: false
+        default: "0.8"
       scan_mode:
         description: "Режим (hybrid / id_range / catalog)"
         required: false
         default: "hybrid"
       max_run_minutes:
-        description: "Лимит времени работы в минутах (345 для облака GitHub, до 590 для self-hosted)"
+        description: "Лимит времени работы в минутах"
         required: false
-        default: "345"
+        default: "120"
 
 concurrency:
   group: roblox-audio-scanner
@@ -26,9 +30,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    # 600 минут = 10 часов (на бесплатных GitHub-раннерах платформа ограничивает потолок 360 мин,
-    # поэтому MAX_RUN_MINUTES=345 сохраняет прогресс заранее без потери данных)
-    timeout-minutes: 600
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -72,8 +74,9 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
           START_ASSET_ID: ${{ vars.START_ASSET_ID || '17500000000' }}
-          TARGET_IDS_PER_RUN: ${{ inputs.target_ids || '150000' }}
+          TARGET_IDS_PER_RUN: ${{ inputs.target_ids || '10000' }}
+          REQUEST_DELAY_SEC: ${{ inputs.request_delay || '0.8' }}
           SCAN_MODE: ${{ inputs.scan_mode || 'hybrid' }}
-          MAX_RUN_MINUTES: ${{ inputs.max_run_minutes || '345' }}
-          SCANNER_CONCURRENCY: "25"
+          MAX_RUN_MINUTES: ${{ inputs.max_run_minutes || '120' }}
+          SCANNER_CONCURRENCY: "2"
         run: python -m scanner.roblox_scanner
