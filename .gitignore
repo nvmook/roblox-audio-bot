@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Environment variables (НИКОГДА не коммитить реальные ключи!)
+.env
+.env.local
+.env.*.local
+
+# Vercel
+.vercel/
+
+# Temp audio files
+*.ogg
+*.mp3
+*.wav
+tmp/
