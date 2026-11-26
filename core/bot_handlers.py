@@ -50,9 +50,10 @@ def _render_song_card(
     dur = float(song.get("duration_sec") or 0)
     dur_line = ""
     if dur > 0:
-        mins = int(dur) // 60
-        secs = int(dur) % 60
-        dur_line = f"\n⏱ Длительность: {mins}:{secs:02d}"
+        total_sec = max(1, int(round(dur)))
+        mins = total_sec // 60
+        secs = total_sec % 60
+        dur_line = f"\n⏱ Длина в Roblox: {mins}:{secs:02d}"
 
     text = (
         f"<b>{esc(display_name)}</b>\n"
@@ -474,9 +475,9 @@ async def _process_user_song_submission(
         asset_id=asset_id,
         artist=resolved["artist"],
         title=resolved["title"],
-        roblox_name=roblox_meta["name"],
+        roblox_name=roblox_meta.get("raw_name") or roblox_meta["name"],
         roblox_creator=roblox_meta.get("creator", ""),
-        duration_sec=resolved["duration_sec"],
+        duration_sec=float(roblox_meta.get("duration_sec") or 0.0),
         confidence=resolved["confidence"],
         source="user_submit",
     )
@@ -573,6 +574,7 @@ async def _process_admin_add_song(
         return
 
     asset_id = int(parts[0])
+    roblox_dur = 0.0
     if len(parts) > 1 and parts[1]:
         raw_label = parts[1]
         if " - " in raw_label:
@@ -580,6 +582,9 @@ async def _process_admin_add_song(
         else:
             artist, title = "", raw_label
         r_name = raw_label
+        meta = await check_roblox_audio_id(asset_id)
+        if meta:
+            roblox_dur = float(meta.get("duration_sec") or 0.0)
     else:
         meta = await check_roblox_audio_id(asset_id)
         if not meta:
@@ -592,13 +597,15 @@ async def _process_admin_add_song(
             return
         resolved = await resolve_canonical_track(meta["name"], meta.get("creator", ""))
         artist, title = resolved["artist"], resolved["title"]
-        r_name = meta["name"]
+        r_name = meta.get("raw_name") or meta["name"]
+        roblox_dur = float(meta.get("duration_sec") or 0.0)
 
     await db.upsert_song(
         asset_id=asset_id,
         artist=artist,
         title=title,
         roblox_name=r_name,
+        duration_sec=roblox_dur,
         source="admin",
     )
     await db.set_user_action(admin_id, "")
